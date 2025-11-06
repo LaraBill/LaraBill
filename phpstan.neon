@@ -1,0 +1,39 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+    - phpstan-baseline.neon
+
+parameters:
+    paths:
+        - app
+        - bootstrap
+        - config
+        - database
+        - routes
+        - tests
+
+    # PHPStan level (0-9, higher is more strict)
+    level: 9
+
+    # Exclude certain directories from analysis
+    excludePaths:
+        - bootstrap/cache
+        - storage
+        - vendor
+        - node_modules (?) # Optional - may not exist in CI
+
+    # Check for unused variables
+    checkUninitializedProperties: true
+    checkMissingCallableSignature: true
+    checkInternalClassCaseSensitivity: true
+    checkExplicitMixedMissingReturn: true
+
+    # Laravel-specific settings
+    bootstrapFiles:
+        - vendor/larastan/larastan/bootstrap.php
+
+    # Parallel processing
+    parallel:
+        processTimeout: 300.0
+
+    # Report unused ignores
+    reportUnmatchedIgnoredErrors: false

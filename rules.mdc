@@ -1,0 +1,136 @@
+---
+# LaraBill - Modular Billing & Provisioning Platform
+name: LaraBill
+globs:
+  - "**/*.php"
+  - "app/Core/**"
+  - "app/Modules/**"
+  - "app/Drivers/**"
+  - "routes/**"
+  - "config/**"
+  - "database/**"
+
+instructions: |
+  You are assisting with LaraBill—a configurable billing and provisioning platform built with Laravel 11, Eloquent, MySQL, and Docker.
+
+  ## Project Architecture
+
+  LaraBill is modular by design:
+  - **Billing + Invoicing** modules: CORE, always available for standalone billing management
+  - **Provisioning** module: OPTIONAL, connects "money to machines" by automating resource provisioning when payments are captured
+  - **Drivers**: OPTIONAL packages under app/Drivers/ that integrate with infrastructure providers (only needed with Provisioning)
+  - Each module/driver is self-contained with its own routes, migrations, views, assets, and tests
+  - Modules are enabled/disabled via module.json manifest with "enabled" field
+
+  ## Directory Structure
+
+  - app/Core/: Cross-cutting contracts, support classes, events, enums
+    - Contracts/Drivers/: Capability-based driver interfaces (Provider, Provisioner, Metrics, Inventory, Webhooks)
+  - app/Modules/: Feature modules (Billing, Invoicing, Provisioning)
+    - Each has: src/Config, Database/, Http/, Jobs/, Listeners/, Providers/, Resources/, Routes/, Services/, Tests/
+  - app/Drivers/: Infrastructure provider integrations (Panels, Compute, Game, Cloud)
+    - Each driver declares type and capabilities in module.json
+    - Must implement Core\Contracts\Drivers\* interfaces based on capabilities
+  - bootstrap/modules.php: Auto-registers module providers via ModuleRegistrar
+  - config/modules.php: Module discovery configuration
+
+  ## Module & Driver Rules
+
+  - Each module/driver contains everything it needs: routes, migrations, factories, views, translations, tests
+  - module.json manifest controls activation with "enabled" field and declares dependencies
+  - ModuleServiceProvider in each module registers routes, migrations, views, policies, config
+  - Drivers must declare "type" (Panels, Compute, Game, Cloud) and "capabilities" array
+  - Drivers implement capability-based contracts: Provider (base), Provisioner, Metrics, Inventory, Webhooks
+  - All provider operations MUST be async via Jobs—no long-running HTTP requests
+  - Webhooks contract optional but recommended; otherwise polling is mandatory
+
+  ## Provisioning Architecture (OPTIONAL Module)
+
+  When Provisioning module is enabled:
+  - Resources transition through state machine: PENDING → QUEUED → PROVISIONING → ACTIVE → SUSPENDED/UPDATING/FAILED/DEPROVISIONING → DEPROVISIONED
+  - All state transitions recorded in append-only provision_audits table
+  - Orchestrator rules: all operations async via Jobs, idempotency keys ({order_uuid}:attempt_{n}), exponential backoff with jitter
+  - Database tables: resources, provision_tasks, credentials, plan_maps, provision_audits
+  - Event flow: PaymentCaptured → OnPaymentCaptured listener → KickProvision job → PollTask → audit trail
+  - Key Jobs: KickProvision, PollTask, SyncResourceState, DeprovisionResource
+  - Dedicated "provisioning" queue with Horizon tags: resource:{id}, driver:{name}
+  - Per-driver rate limits and circuit breaker to avoid hitting provider API limits
+
+  ## Autoloading
+
+  PSR-4 namespaces in composer.json:
+  - LaraBill\Core\ → app/Core/
+  - LaraBill\Modules\ → app/Modules/
+  - LaraBill\Drivers\ → app/Drivers/
+
+  Run `composer dump-autoload` after edits.
+
+  ## Coding Standards
+
+  - PHP 8.3+ with strict types where possible
+  - No business logic in controllers or models — use Services or Actions
+  - Money = DECIMAL(19,4) everywhere
+  - Eager-load relationships, paginate queries, no unbounded queries
+  - Transactions wrap renewals, invoices, payments
+  - Tools: pint, Larastan/PHPStan max level
+  - Commit format: ✨ feat, 🚀 perf, 🐛 fix, 🔧 chore, ♻️ refactor
+  - One feature per PR with migrations, rollback notes, performance notes, linked issues
+
+  ## Testing Requirements
+
+  - Framework: Pest or PHPUnit
+  - Coverage gate ≥ 80% for domain/service code
+  - Test types: Unit, Feature, Integration, Golden-Master (PDF/HTML snapshots)
+  - Module tests in src/Tests/
+  - Drivers ship FakeDriver.php for integration tests without hitting real APIs
+  - Provisioning tests only run if module is enabled
+  - CI runs `php artisan test` across all modules
+
+  ## Security & Data
+
+  - No PII in logs; mask API tokens, hash provider resource IDs when logging
+  - Webhooks verified by signature & timestamp
+  - Sensitive fields encrypted with Laravel's encrypter
+  - Credentials vault: credentials table stores encrypted provider API keys/secrets
+  - Per-customer credential storage—never in .env for multi-tenant
+  - RBAC abilities: provision.*, resource.*, credentials.* for fine-grained access
+  - Append-only audit logs: never delete, never update
+
+  ## Performance & Caching
+
+  - Kill N+1 queries with with()/loadCount()
+  - Cache read-mostly data (plans, taxes) via Redis tags
+  - Queue heavy work with Horizon + idempotency keys
+  - Track metrics: task latency, success rate, retries, driver API response time
+  - Use `php artisan larabill:doctor` and `npm run doctor:npm` to verify dependencies
+
+  ## Database
+
+  - Migrations per module under Database/Migrations/
+  - Laravel auto-loads via loadMigrationsFrom()
+  - Composite indexes for user_id+status, status+due_date
+  - One concern per migration; never edit history
+  - billing_items.resource_id links invoices to provisioned resources (when Provisioning enabled)
+
+  ## Frontend Assets (Vite)
+
+  - Single vite.config.ts auto-discovers: app/Modules/*/src/Resources/assets/app.{ts,scss}
+  - Build once: npm run build → public/build/
+  - Each module loads its own assets in views
+  - Optional @viteIfExists() Blade directive guards missing assets
+  - Drivers can ship admin config UI in Resources/views/admin/
+
+  ## Dependency Management
+
+  - All PHP deps in root composer.json
+  - All JS deps in root package.json
+  - Each module.json lists desired deps (composer/npm sections)
+  - larabill:doctor and npm run doctor:npm validate deps—do NOT auto-install
+
+  ## Module Configuration
+
+  Control modules via module.json manifest:
+  - Set "enabled": true to activate, false to disable
+  - ModuleRegistrar scans module.json and registers only enabled modules
+  - Billing-only mode: disable Provisioning module
+  - Billing + Provisioning: enable Provisioning module and required drivers

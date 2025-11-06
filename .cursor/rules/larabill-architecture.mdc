@@ -1,0 +1,245 @@
+---
+name: LaraBill Architecture
+description: Core architecture, module system, directory structure, and autoloading
+alwaysApply: always
+globs:
+  - "**/*.php"
+  - "app/Core/**"
+  - "app/Modules/**"
+  - "app/Drivers/**"
+  - "**/module.json"
+---
+
+You are working with LaraBill—a modular billing and provisioning platform built with Laravel 11, Eloquent, MySQL, and Docker.
+
+## Project Overview
+
+LaraBill is designed with modularity as a core principle:
+
+- **Billing + Invoicing modules**: CORE modules, always available for standalone billing management
+- **Provisioning module**: OPTIONAL, connects "money to machines" by automating resource provisioning when payments are captured
+- **Drivers**: OPTIONAL packages under `app/Drivers/` that integrate with infrastructure providers (only needed with Provisioning module)
+
+Each module/driver is self-contained with its own routes, migrations, views, assets, and tests.
+
+## Directory Structure
+
+```
+app/
+├── Core/                           # Cross-cutting concerns
+│   ├── Contracts/
+│   │   └── Drivers/                # Capability-based driver interfaces
+│   │       ├── Provider.php        # Base provider interface
+│   │       ├── Provisioner.php     # Provisioning capability
+│   │       ├── Metrics.php         # Metrics collection capability
+│   │       ├── Inventory.php       # Inventory sync capability
+│   │       └── Webhooks.php        # Webhook handling capability
+│   ├── Support/                    # Shared utilities
+│   ├── Events/                     # Cross-module events
+│   └── Enums/                      # Shared enumerations
+│
+├── Modules/                        # Feature modules
+│   ├── Billing/
+│   ├── Invoicing/
+│   └── Provisioning/               # OPTIONAL
+│       └── src/
+│           ├── Config/
+│           ├── Database/
+│           │   └── Migrations/
+│           ├── Http/
+│           │   ├── Controllers/
+│           │   └── Requests/
+│           ├── Jobs/
+│           ├── Listeners/
+│           ├── Providers/
+│           │   └── ProvisioningServiceProvider.php
+│           ├── Resources/
+│           │   ├── assets/
+│           │   └── views/
+│           ├── Routes/
+│           ├── Services/
+│           └── Tests/
+│
+└── Drivers/                        # Infrastructure provider integrations
+    ├── Panels/                     # Control panel drivers (e.g., cPanel, Plesk)
+    ├── Compute/                    # Compute drivers (e.g., Proxmox, AWS EC2)
+    ├── Game/                       # Game server drivers (e.g., Pterodactyl)
+    └── Cloud/                      # Cloud service drivers (e.g., S3, DigitalOcean)
+```
+
+## Module System
+
+### Module Manifest (module.json)
+
+Every module and driver includes a `module.json` manifest that controls activation and declares metadata:
+
+```json
+{
+  "name": "Provisioning",
+  "enabled": true,
+  "version": "1.0.0",
+  "description": "Automates resource provisioning on payment",
+  "providers": [
+    "LaraBill\\Modules\\Provisioning\\Providers\\ProvisioningServiceProvider"
+  ],
+  "dependencies": {
+    "modules": ["Billing", "Invoicing"],
+    "composer": {
+      "brick/money": "^0.9"
+    },
+    "npm": {
+      "@vueuse/core": "^10.0"
+    }
+  }
+}
+```
+
+**Key fields:**
+
+- `enabled`: Boolean controlling module activation
+- `dependencies.modules`: Required modules that must be enabled
+- `dependencies.composer`: PHP packages needed (validated, not auto-installed)
+- `dependencies.npm`: JS packages needed (validated, not auto-installed)
+
+### Driver Manifest Example
+
+Drivers extend the module.json with type and capabilities:
+
+```json
+{
+  "name": "Proxmox",
+  "enabled": true,
+  "type": "Compute",
+  "capabilities": ["Provider", "Provisioner", "Metrics", "Webhooks"],
+  "version": "1.0.0",
+  "providers": [
+    "LaraBill\\Drivers\\Compute\\Proxmox\\ProxmoxServiceProvider"
+  ],
+  "config": {
+    "supports_suspend": true,
+    "supports_resize": true,
+    "supports_snapshots": true
+  }
+}
+```
+
+**Driver types:** `Panels`, `Compute`, `Game`, `Cloud`
+
+**Capabilities:** Drivers implement only the interfaces they declare in `capabilities` array
+
+## Module Registration
+
+Modules are auto-registered via `bootstrap/modules.php` using `ModuleRegistrar`:
+
+```php
+<?php
+
+use LaraBill\Core\Support\ModuleRegistrar;
+
+$modules = new ModuleRegistrar(base_path());
+
+return $modules->discover()->register();
+```
+
+The registrar scans for `module.json` files and registers only enabled modules.
+
+### ModuleServiceProvider Pattern
+
+Each module includes a service provider:
+
+```php
+<?php
+
+namespace LaraBill\Modules\Provisioning\Providers;
+
+use Illuminate\Support\ServiceProvider;
+
+class ProvisioningServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        $this->mergeConfigFrom(__DIR__ . '/../Config/provisioning.php', 'provisioning');
+    }
+
+    public function boot(): void
+    {
+        // Routes
+        $this->loadRoutesFrom(__DIR__ . '/../Routes/web.php');
+        $this->loadRoutesFrom(__DIR__ . '/../Routes/api.php');
+
+        // Migrations
+        $this->loadMigrationsFrom(__DIR__ . '/../Database/Migrations');
+
+        // Views
+        $this->loadViewsFrom(__DIR__ . '/../Resources/views', 'provisioning');
+
+        // Translations
+        $this->loadTranslationsFrom(__DIR__ . '/../Resources/lang', 'provisioning');
+
+        // Policies (if applicable)
+        // Gate::policy(Resource::class, ResourcePolicy::class);
+    }
+}
+```
+
+## PSR-4 Autoloading
+
+Namespaces are configured in root `composer.json`:
+
+```json
+{
+  "autoload": {
+    "psr-4": {
+      "LaraBill\\Core\\": "app/Core/",
+      "LaraBill\\Modules\\": "app/Modules/",
+      "LaraBill\\Drivers\\": "app/Drivers/"
+    }
+  }
+}
+```
+
+**After adding new modules or drivers:** Run `composer dump-autoload`
+
+## Module Configuration Modes
+
+### Billing-Only Mode
+
+For standalone billing without provisioning:
+
+```json
+// app/Modules/Provisioning/module.json
+{
+  "name": "Provisioning",
+  "enabled": false  // Disable provisioning
+}
+```
+
+All drivers can remain disabled. System functions as pure billing platform.
+
+### Billing + Provisioning Mode
+
+Enable provisioning and required drivers:
+
+```json
+// app/Modules/Provisioning/module.json
+{
+  "name": "Provisioning",
+  "enabled": true
+}
+
+// app/Drivers/Compute/Proxmox/module.json
+{
+  "name": "Proxmox",
+  "enabled": true,
+  "type": "Compute",
+  "capabilities": ["Provider", "Provisioner", "Metrics"]
+}
+```
+
+## Best Practices
+
+1. **Self-contained modules**: Each module contains everything it needs—never reference files from other modules directly
+2. **Dependency declaration**: Always declare module dependencies in `module.json`
+3. **No cross-module imports**: Use events and contracts to communicate between modules
+4. **Configuration publishing**: Use `mergeConfigFrom()` and provide sensible defaults
+5. **Provider registration**: Always register your ModuleServiceProvider in `module.json`

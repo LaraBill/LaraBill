@@ -1,0 +1,443 @@
+---
+name: LaraBill Drivers & Provisioning
+description: Driver contracts, provisioning orchestration, state machines, and async operations
+alwaysApply: contextual
+globs:
+  - "app/Drivers/**"
+  - "app/Modules/Provisioning/**"
+  - "app/Core/Contracts/Drivers/**"
+---
+
+## Driver Types & Capabilities
+
+LaraBill uses capability-based driver contracts. Drivers declare which capabilities they support and implement only those interfaces.
+
+### Driver Types
+
+- **Panels**: Control panel integrations (cPanel, Plesk, DirectAdmin)
+- **Compute**: Virtual machine providers (Proxmox, VMware, AWS EC2)
+- **Game**: Game server platforms (Pterodactyl, AMP, TCAdmin)
+- **Cloud**: Cloud services (S3, DigitalOcean Spaces, Backblaze)
+
+### Core Capabilities
+
+1. **Provider** (base): All drivers must implement
+2. **Provisioner**: Can create/delete resources
+3. **Metrics**: Can report usage metrics (bandwidth, disk, CPU)
+4. **Inventory**: Can sync available plans/templates
+5. **Webhooks**: Can receive real-time status updates from provider
+
+## Driver Contract Examples
+
+### Provider Interface (Base)
+
+```php
+<?php
+
+namespace LaraBill\Core\Contracts\Drivers;
+
+interface Provider
+{
+    /**
+     * Test connection and credentials
+     */
+    public function testConnection(): bool;
+
+    /**
+     * Get driver metadata
+     */
+    public function getDriverInfo(): array;
+}
+```
+
+### Provisioner Interface
+
+```php
+<?php
+
+namespace LaraBill\Core\Contracts\Drivers;
+
+interface Provisioner
+{
+    /**
+     * Create a new resource (async via job)
+     *
+     * @param array $params Resource creation parameters
+     * @param string $idempotencyKey Unique key for retry safety
+     * @return string Provider's task/job identifier
+     */
+    public function create(array $params, string $idempotencyKey): string;
+
+    /**
+     * Check provisioning task status
+     *
+     * @return array ['status' => 'pending|completed|failed', 'resource_id' => '...', 'error' => null]
+     */
+    public function getTaskStatus(string $taskId): array;
+
+    /**
+     * Suspend an active resource
+     */
+    public function suspend(string $resourceId, string $idempotencyKey): bool;
+
+    /**
+     * Unsuspend a suspended resource
+     */
+    public function unsuspend(string $resourceId, string $idempotencyKey): bool;
+
+    /**
+     * Terminate and delete a resource
+     */
+    public function terminate(string $resourceId, string $idempotencyKey): bool;
+}
+```
+
+### Example Driver Implementation
+
+```php
+<?php
+
+namespace LaraBill\Drivers\Compute\Proxmox;
+
+use LaraBill\Core\Contracts\Drivers\Provider;
+use LaraBill\Core\Contracts\Drivers\Provisioner;
+use LaraBill\Core\Contracts\Drivers\Metrics;
+
+class ProxmoxDriver implements Provider, Provisioner, Metrics
+{
+    public function __construct(
+        private ProxmoxApiClient $client,
+        private string $nodeId
+    ) {}
+
+    public function testConnection(): bool
+    {
+        return $this->client->ping();
+    }
+
+    public function create(array $params, string $idempotencyKey): string
+    {
+        // Proxmox uses UPID (Unique Process ID) for task tracking
+        $upid = $this->client->createVm([
+            'vmid' => $params['vmid'],
+            'cores' => $params['cpu'],
+            'memory' => $params['memory'],
+            'ostemplate' => $params['template'],
+            'hostname' => $params['hostname'],
+        ], $idempotencyKey);
+
+        return $upid; // Return task ID for polling
+    }
+
+    public function getTaskStatus(string $taskId): array
+    {
+        $status = $this->client->getTaskStatus($taskId);
+
+        return [
+            'status' => match($status['status']) {
+                'running' => 'pending',
+                'stopped' => $status['exitstatus'] === 'OK' ? 'completed' : 'failed',
+                default => 'pending',
+            },
+            'resource_id' => $status['vmid'] ?? null,
+            'error' => $status['exitstatus'] === 'OK' ? null : $status['stderr'],
+        ];
+    }
+
+    public function collectMetrics(string $resourceId): array
+    {
+        return $this->client->getVmStatus($resourceId);
+    }
+}
+```
+
+## Provisioning State Machine
+
+Resources transition through defined states:
+
+```
+PENDING → Order created, payment pending
+    ↓
+QUEUED → Payment captured, awaiting provisioning job
+    ↓
+PROVISIONING → Driver is creating the resource
+    ↓
+ACTIVE → Resource successfully provisioned and running
+    ↓
+SUSPENDED → Temporarily disabled (non-payment, abuse)
+UPDATING → Configuration change in progress
+FAILED → Provisioning failed (requires manual intervention)
+DEPROVISIONING → Resource being terminated
+    ↓
+DEPROVISIONED → Resource fully removed from provider
+```
+
+### State Transition Rules
+
+- All state changes recorded in `provision_audits` table (append-only)
+- FAILED resources can retry provisioning or require manual resolution
+- SUSPENDED resources can transition to ACTIVE (unsuspend) or DEPROVISIONING
+- DEPROVISIONED is terminal state
+
+## Provisioning Event Flow
+
+```
+1. PaymentCaptured event fired
+        ↓
+2. OnPaymentCaptured listener
+        ↓
+3. Dispatch KickProvision job
+        ↓
+4. KickProvision calls driver->create()
+        ↓
+5. Store task ID, dispatch PollTask job (delayed)
+        ↓
+6. PollTask checks driver->getTaskStatus()
+        ↓
+7a. If pending: re-dispatch PollTask (exponential backoff)
+7b. If completed: update resource state to ACTIVE, create audit log
+7c. If failed: update state to FAILED, log error
+```
+
+## Key Provisioning Jobs
+
+### KickProvision Job
+
+```php
+<?php
+
+namespace LaraBill\Modules\Provisioning\Jobs;
+
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Queue\InteractsWithQueue;
+
+class KickProvision implements ShouldQueue
+{
+    use Queueable, InteractsWithQueue;
+
+    public function __construct(
+        private int $resourceId,
+        private int $attempt = 1
+    ) {
+        $this->onQueue('provisioning');
+        $this->tags(['resource:' . $resourceId, 'driver:' . $this->getDriverName()]);
+    }
+
+    public function handle(): void
+    {
+        $resource = Resource::findOrFail($this->resourceId);
+
+        // Generate idempotency key
+        $idempotencyKey = "{$resource->order_uuid}:attempt_{$this->attempt}";
+
+        // Call driver
+        $driver = app(DriverResolver::class)->resolve($resource->driver_name);
+        $taskId = $driver->create($resource->provision_params, $idempotencyKey);
+
+        // Store task and schedule polling
+        ProvisionTask::create([
+            'resource_id' => $resource->id,
+            'task_id' => $taskId,
+            'driver_name' => $resource->driver_name,
+            'attempt' => $this->attempt,
+        ]);
+
+        PollTask::dispatch($taskId)->delay(now()->addSeconds(5));
+    }
+}
+```
+
+### PollTask Job with Exponential Backoff
+
+```php
+<?php
+
+namespace LaraBill\Modules\Provisioning\Jobs;
+
+class PollTask implements ShouldQueue
+{
+    use Queueable, InteractsWithQueue;
+
+    private int $maxAttempts = 20;
+    private int $baseDelay = 5; // seconds
+
+    public function __construct(
+        private string $taskId,
+        private int $pollCount = 1
+    ) {
+        $this->onQueue('provisioning');
+    }
+
+    public function handle(): void
+    {
+        $task = ProvisionTask::where('task_id', $this->taskId)->firstOrFail();
+        $driver = app(DriverResolver::class)->resolve($task->driver_name);
+
+        $status = $driver->getTaskStatus($this->taskId);
+
+        match($status['status']) {
+            'completed' => $this->handleSuccess($task, $status),
+            'failed' => $this->handleFailure($task, $status),
+            'pending' => $this->schedulePoll($task),
+        };
+    }
+
+    private function schedulePoll(ProvisionTask $task): void
+    {
+        if ($this->pollCount >= $this->maxAttempts) {
+            $this->handleTimeout($task);
+            return;
+        }
+
+        // Exponential backoff with jitter
+        $delay = $this->baseDelay * (2 ** $this->pollCount);
+        $jitter = random_int(0, (int)($delay * 0.1)); // 10% jitter
+
+        PollTask::dispatch($this->taskId, $this->pollCount + 1)
+            ->delay(now()->addSeconds($delay + $jitter));
+    }
+
+    private function handleSuccess(ProvisionTask $task, array $status): void
+    {
+        DB::transaction(function () use ($task, $status) {
+            $resource = $task->resource;
+            $resource->update([
+                'status' => 'ACTIVE',
+                'provider_resource_id' => $status['resource_id'],
+            ]);
+
+            ProvisionAudit::create([
+                'resource_id' => $resource->id,
+                'from_state' => 'PROVISIONING',
+                'to_state' => 'ACTIVE',
+                'metadata' => $status,
+            ]);
+        });
+    }
+}
+```
+
+## Idempotency Pattern
+
+All driver operations use idempotency keys to ensure safe retries:
+
+```php
+// Format: {order_uuid}:attempt_{n}
+$idempotencyKey = "{$order->uuid}:attempt_1";
+
+// Driver implements idempotency check
+public function create(array $params, string $idempotencyKey): string
+{
+    // Check if already processed
+    if ($existingTask = $this->cache->get("idempotency:{$idempotencyKey}")) {
+        return $existingTask; // Return cached task ID
+    }
+
+    $taskId = $this->client->createResource($params);
+
+    // Cache for 24 hours
+    $this->cache->put("idempotency:{$idempotencyKey}", $taskId, 86400);
+
+    return $taskId;
+}
+```
+
+## Queue Configuration
+
+Provisioning uses dedicated queue with tags for monitoring:
+
+```php
+// config/queue.php
+'connections' => [
+    'redis' => [
+        'provisioning' => [
+            'queue' => 'provisioning',
+            'retry_after' => 300,
+        ],
+    ],
+],
+
+// Horizon tags
+KickProvision::dispatch($resourceId)
+    ->onQueue('provisioning')
+    ->tags([
+        'resource:' . $resourceId,
+        'driver:proxmox',
+        'operation:create'
+    ]);
+```
+
+## Rate Limiting & Circuit Breaker
+
+Protect provider APIs from overload:
+
+```php
+<?php
+
+namespace LaraBill\Drivers\Compute\Proxmox;
+
+use Illuminate\Support\Facades\RateLimiter;
+
+class ProxmoxDriver
+{
+    public function create(array $params, string $idempotencyKey): string
+    {
+        // Rate limit: 10 requests per minute per node
+        RateLimiter::attempt(
+            key: "proxmox:{$this->nodeId}",
+            maxAttempts: 10,
+            callback: fn() => $this->client->createVm($params),
+            decaySeconds: 60
+        );
+    }
+}
+```
+
+## Database Schema
+
+```php
+// resources table
+Schema::create('resources', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('order_id')->constrained();
+    $table->string('driver_name');
+    $table->string('status'); // PENDING, QUEUED, PROVISIONING, etc.
+    $table->string('provider_resource_id')->nullable();
+    $table->json('provision_params');
+    $table->timestamps();
+
+    $table->index(['status', 'created_at']);
+});
+
+// provision_tasks table
+Schema::create('provision_tasks', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('resource_id')->constrained();
+    $table->string('task_id'); // Provider's task identifier
+    $table->string('driver_name');
+    $table->integer('attempt')->default(1);
+    $table->timestamps();
+});
+
+// provision_audits table (append-only)
+Schema::create('provision_audits', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('resource_id')->constrained();
+    $table->string('from_state');
+    $table->string('to_state');
+    $table->json('metadata')->nullable();
+    $table->timestamp('created_at');
+
+    $table->index(['resource_id', 'created_at']);
+});
+```
+
+## Critical Rules
+
+1. **Always async**: Never make synchronous API calls in HTTP requests—use jobs
+2. **Idempotency required**: All driver operations must accept and honor idempotency keys
+3. **Append-only audits**: Never update or delete audit records
+4. **Exponential backoff**: Implement backoff with jitter for polling operations
+5. **Rate limiting**: Respect provider API limits with RateLimiter
+6. **Timeout handling**: Define max polling attempts and handle timeouts gracefully

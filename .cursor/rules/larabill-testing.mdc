@@ -1,0 +1,475 @@
+---
+name: LaraBill Testing
+description: Test structure, coverage gates, fake drivers, and golden masters
+alwaysApply: contextual
+globs:
+  - "app/Modules/**/Tests/**"
+  - "app/Drivers/**/Tests/**"
+  - "tests/**"
+---
+
+## Testing Framework
+
+LaraBill supports both **Pest** and **PHPUnit**. Choose based on team preference.
+
+### Pest Example
+
+```php
+<?php
+
+use LaraBill\Modules\Billing\Services\InvoiceService;
+use LaraBill\Modules\Billing\Models\Invoice;
+
+it('creates an invoice with correct totals', function () {
+    $user = User::factory()->create();
+    $items = [
+        ['description' => 'Web Hosting', 'amount' => 10.00, 'quantity' => 1],
+        ['description' => 'Domain', 'amount' => 15.00, 'quantity' => 2],
+    ];
+
+    $service = app(InvoiceService::class);
+    $invoice = $service->create($user->id, $items);
+
+    expect($invoice->subtotal)->toBe('40.0000')
+        ->and($invoice->items)->toHaveCount(2);
+});
+```
+
+### PHPUnit Example
+
+```php
+<?php
+
+namespace LaraBill\Modules\Billing\Tests\Unit;
+
+use Tests\TestCase;
+use LaraBill\Modules\Billing\Services\InvoiceService;
+
+class InvoiceServiceTest extends TestCase
+{
+    public function test_creates_invoice_with_correct_totals(): void
+    {
+        $user = User::factory()->create();
+        $items = [
+            ['description' => 'Web Hosting', 'amount' => 10.00, 'quantity' => 1],
+            ['description' => 'Domain', 'amount' => 15.00, 'quantity' => 2],
+        ];
+
+        $service = app(InvoiceService::class);
+        $invoice = $service->create($user->id, $items);
+
+        $this->assertEquals('40.0000', $invoice->subtotal);
+        $this->assertCount(2, $invoice->items);
+    }
+}
+```
+
+## Test Organization
+
+Tests are organized by type and located within each module:
+
+```
+app/Modules/Billing/src/Tests/
+├── Unit/               # Isolated unit tests (services, value objects)
+│   ├── MoneyTest.php
+│   └── TaxCalculatorTest.php
+├── Feature/            # HTTP endpoint and integration tests
+│   ├── InvoiceControllerTest.php
+│   └── SubscriptionRenewalTest.php
+└── Integration/        # Cross-module integration tests
+    └── BillingProvisioningFlowTest.php
+
+app/Drivers/Compute/Proxmox/Tests/
+├── Unit/
+│   └── ProxmoxDriverTest.php
+└── Fakes/
+    └── FakeProxmoxDriver.php
+```
+
+## Coverage Requirements
+
+**Minimum 80% code coverage** for domain and service code.
+
+Run coverage report:
+
+```bash
+php artisan test --coverage --min=80
+```
+
+**What to cover:**
+- All service classes (100% coverage goal)
+- Business logic and calculations
+- State machines and transitions
+- Value objects and DTOs
+
+**What can skip:**
+- Simple migrations (schema only)
+- Basic getters/setters
+- Framework boilerplate
+
+## Fake Drivers
+
+Every driver **must ship with a Fake implementation** for testing without hitting real APIs.
+
+### FakeDriver Implementation
+
+```php
+<?php
+
+namespace LaraBill\Drivers\Compute\Proxmox\Tests\Fakes;
+
+use LaraBill\Core\Contracts\Drivers\Provider;
+use LaraBill\Core\Contracts\Drivers\Provisioner;
+
+class FakeProxmoxDriver implements Provider, Provisioner
+{
+    private array $resources = [];
+    private array $tasks = [];
+    private bool $shouldFail = false;
+
+    public function shouldFail(bool $fail = true): self
+    {
+        $this->shouldFail = $fail;
+        return $this;
+    }
+
+    public function testConnection(): bool
+    {
+        return !$this->shouldFail;
+    }
+
+    public function create(array $params, string $idempotencyKey): string
+    {
+        if ($this->shouldFail) {
+            throw new \Exception('Simulated provisioning failure');
+        }
+
+        $taskId = 'UPID:fake-' . uniqid();
+
+        $this->tasks[$taskId] = [
+            'status' => 'running',
+            'params' => $params,
+            'idempotency_key' => $idempotencyKey,
+        ];
+
+        return $taskId;
+    }
+
+    public function getTaskStatus(string $taskId): array
+    {
+        if (!isset($this->tasks[$taskId])) {
+            return ['status' => 'failed', 'error' => 'Task not found'];
+        }
+
+        // Simulate task completion
+        if ($this->tasks[$taskId]['status'] === 'running') {
+            $this->tasks[$taskId]['status'] = 'completed';
+            $resourceId = 'vm-' . rand(100, 999);
+            $this->resources[$resourceId] = $this->tasks[$taskId]['params'];
+            $this->tasks[$taskId]['resource_id'] = $resourceId;
+        }
+
+        $task = $this->tasks[$taskId];
+
+        return [
+            'status' => $task['status'] === 'completed' ? 'completed' : 'pending',
+            'resource_id' => $task['resource_id'] ?? null,
+            'error' => null,
+        ];
+    }
+
+    public function suspend(string $resourceId, string $idempotencyKey): bool
+    {
+        if (isset($this->resources[$resourceId])) {
+            $this->resources[$resourceId]['suspended'] = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    public function terminate(string $resourceId, string $idempotencyKey): bool
+    {
+        unset($this->resources[$resourceId]);
+        return true;
+    }
+
+    // Helper for assertions
+    public function getCreatedResources(): array
+    {
+        return $this->resources;
+    }
+}
+```
+
+### Using Fake in Tests
+
+```php
+<?php
+
+use LaraBill\Drivers\Compute\Proxmox\Tests\Fakes\FakeProxmoxDriver;
+use LaraBill\Modules\Provisioning\Jobs\KickProvision;
+
+it('provisions resource successfully', function () {
+    $fakeDriver = new FakeProxmoxDriver();
+
+    // Bind fake driver
+    $this->app->instance('driver.proxmox', $fakeDriver);
+
+    $resource = Resource::factory()->create([
+        'driver_name' => 'proxmox',
+        'status' => 'QUEUED',
+    ]);
+
+    // Dispatch provisioning job
+    KickProvision::dispatch($resource->id);
+
+    // Assert task created
+    $this->assertDatabaseHas('provision_tasks', [
+        'resource_id' => $resource->id,
+    ]);
+
+    // Simulate task completion
+    $task = ProvisionTask::where('resource_id', $resource->id)->first();
+    $status = $fakeDriver->getTaskStatus($task->task_id);
+
+    expect($status['status'])->toBe('completed')
+        ->and($status['resource_id'])->not->toBeNull();
+});
+
+it('handles provisioning failure gracefully', function () {
+    $fakeDriver = (new FakeProxmoxDriver())->shouldFail();
+
+    $this->app->instance('driver.proxmox', $fakeDriver);
+
+    $resource = Resource::factory()->create(['status' => 'QUEUED']);
+
+    expect(fn() => KickProvision::dispatch($resource->id))
+        ->toThrow(\Exception::class, 'Simulated provisioning failure');
+});
+```
+
+## Provisioning Tests
+
+Provisioning tests should only run when the module is enabled:
+
+```php
+<?php
+
+use Illuminate\Support\Facades\Config;
+
+beforeEach(function () {
+    if (!Config::get('modules.provisioning.enabled')) {
+        $this->markTestSkipped('Provisioning module is disabled');
+    }
+});
+
+it('queues provisioning job on payment capture', function () {
+    Queue::fake();
+
+    $payment = Payment::factory()->create([
+        'status' => 'completed',
+        'requires_provisioning' => true,
+    ]);
+
+    event(new PaymentCaptured($payment));
+
+    Queue::assertPushed(KickProvision::class, function ($job) use ($payment) {
+        return $job->resourceId === $payment->resource_id;
+    });
+});
+```
+
+## Feature Tests
+
+Test HTTP endpoints and full request/response cycles:
+
+```php
+<?php
+
+use LaraBill\Models\User;
+
+it('creates invoice via API', function () {
+    $user = User::factory()->create();
+
+    $response = $this->actingAs($user)->postJson('/api/invoices', [
+        'items' => [
+            ['description' => 'Hosting', 'amount' => 25.00, 'quantity' => 1],
+        ],
+        'due_date' => now()->addDays(30)->toDateString(),
+    ]);
+
+    $response->assertStatus(201)
+        ->assertJsonStructure([
+            'invoice' => ['id', 'total', 'due_date'],
+        ]);
+
+    $this->assertDatabaseHas('invoices', [
+        'user_id' => $user->id,
+        'total' => '25.0000',
+    ]);
+});
+
+it('prevents unauthorized access to other users invoices', function () {
+    $user = User::factory()->create();
+    $otherUser = User::factory()->create();
+    $invoice = Invoice::factory()->for($otherUser)->create();
+
+    $response = $this->actingAs($user)->getJson("/api/invoices/{$invoice->id}");
+
+    $response->assertStatus(403);
+});
+```
+
+## Golden Master Tests
+
+Use snapshot testing for PDF and HTML invoices to catch unexpected rendering changes:
+
+```php
+<?php
+
+use Spatie\Snapshots\MatchesSnapshots;
+
+it('generates correct invoice PDF', function () {
+    $invoice = Invoice::factory()
+        ->has(InvoiceItem::factory()->count(3))
+        ->create();
+
+    $pdf = app(InvoicePdfGenerator::class)->generate($invoice);
+
+    // Store first run as golden master in tests/__snapshots__/
+    $this->assertMatchesSnapshot($pdf->output());
+});
+
+it('renders invoice HTML correctly', function () {
+    $invoice = Invoice::factory()
+        ->has(InvoiceItem::factory()->count(2))
+        ->create();
+
+    $html = view('invoicing::pdf.invoice', ['invoice' => $invoice])->render();
+
+    $this->assertMatchesSnapshot($html);
+});
+```
+
+**Golden Master workflow:**
+1. First run creates snapshot file
+2. Subsequent runs compare against snapshot
+3. Intentional changes: update snapshots with `--update-snapshots` flag
+4. Unintentional changes: test fails, investigate
+
+## Database Transactions in Tests
+
+Rollback database after each test to maintain clean state:
+
+```php
+<?php
+
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+uses(RefreshDatabase::class);
+
+it('creates and rolls back invoice', function () {
+    $invoice = Invoice::factory()->create();
+
+    expect(Invoice::count())->toBe(1);
+
+    // Automatically rolled back after test
+});
+```
+
+### Testing Transactions
+
+```php
+<?php
+
+use Illuminate\Support\Facades\DB;
+
+it('rolls back transaction on payment failure', function () {
+    DB::beginTransaction();
+
+    $invoice = Invoice::factory()->create(['status' => 'pending']);
+
+    // Simulate payment failure
+    try {
+        throw new PaymentFailedException('Card declined');
+    } catch (PaymentFailedException $e) {
+        DB::rollBack();
+    }
+
+    // Invoice should still be pending (not marked paid)
+    expect($invoice->fresh()->status)->toBe('pending');
+});
+```
+
+## CI Configuration
+
+Run all tests in CI:
+
+```bash
+php artisan test --parallel --coverage --min=80
+```
+
+### GitHub Actions Example
+
+```yaml
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.3
+          coverage: xdebug
+
+      - name: Install Dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Run Tests
+        run: php artisan test --parallel --coverage --min=80
+
+      - name: Run PHPStan
+        run: ./vendor/bin/phpstan analyse
+```
+
+## Test Best Practices
+
+1. **Arrange-Act-Assert**: Structure tests clearly
+2. **Factory usage**: Use factories for test data, not manual creation
+3. **Descriptive names**: Test names explain what is being tested
+4. **One assertion focus**: Each test should verify one behavior
+5. **Fake external services**: Never hit real APIs in tests
+6. **Fast tests**: Keep unit tests under 100ms each
+7. **Isolated tests**: Tests should not depend on each other
+
+### Example: Well-Structured Test
+
+```php
+<?php
+
+it('calculates invoice total with tax correctly', function () {
+    // Arrange
+    $items = [
+        ['description' => 'Item 1', 'amount' => '10.0000', 'quantity' => 2],
+        ['description' => 'Item 2', 'amount' => '5.0000', 'quantity' => 1],
+    ];
+    $taxRate = '0.0825'; // 8.25%
+
+    // Act
+    $calculator = new InvoiceCalculator($taxRate);
+    $result = $calculator->calculate($items);
+
+    // Assert
+    expect($result['subtotal'])->toBe('25.0000')
+        ->and($result['tax'])->toBe('2.0625')
+        ->and($result['total'])->toBe('27.0625');
+});
+```

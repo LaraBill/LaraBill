@@ -1,0 +1,486 @@
+---
+name: LaraBill Security
+description: PII handling, encryption, credentials vault, RBAC, and audit logs
+alwaysApply: contextual
+globs:
+  - "**/*.php"
+  - "app/Modules/**/Policies/**"
+  - "database/migrations/*_create_credentials_*.php"
+  - "app/Core/Support/Logging/**"
+---
+
+## Logging & PII Protection
+
+**Never log personally identifiable information (PII).** Always mask or hash sensitive data.
+
+### Logging Best Practices
+
+```php
+<?php
+
+use Illuminate\Support\Facades\Log;
+
+// Bad: Logs sensitive data
+Log::info('User login', [
+    'email' => $user->email,
+    'api_token' => $user->api_token,
+    'ip' => request()->ip(),
+]);
+
+// Good: Masked sensitive fields
+Log::info('User login', [
+    'user_id' => $user->id,
+    'ip' => request()->ip(),
+    'timestamp' => now()->toIso8601String(),
+]);
+
+// Good: Hash provider resource IDs for privacy
+Log::info('Provisioning started', [
+    'resource_id' => $resource->id,
+    'provider_resource_hash' => hash('sha256', $resource->provider_resource_id),
+    'driver' => $resource->driver_name,
+]);
+```
+
+**Rules:**
+- Log user IDs, not emails or names
+- Hash provider resource identifiers
+- Never log API tokens, passwords, or secrets
+- Use structured logging with context arrays
+
+## Webhook Verification
+
+**Always verify webhook signatures and timestamps** to prevent replay attacks.
+
+```php
+<?php
+
+namespace LaraBill\Modules\Provisioning\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+
+class WebhookController extends Controller
+{
+    private const MAX_TIMESTAMP_DIFF = 300; // 5 minutes
+
+    public function handle(Request $request, string $driverName)
+    {
+        // 1. Verify signature
+        if (!$this->verifySignature($request, $driverName)) {
+            Log::warning('Webhook signature verification failed', [
+                'driver' => $driverName,
+                'ip' => $request->ip(),
+            ]);
+
+            return response()->json(['error' => 'Invalid signature'], 401);
+        }
+
+        // 2. Verify timestamp to prevent replay
+        $timestamp = $request->header('X-Webhook-Timestamp');
+        if (!$this->isTimestampValid($timestamp)) {
+            Log::warning('Webhook timestamp invalid', [
+                'driver' => $driverName,
+                'timestamp' => $timestamp,
+            ]);
+
+            return response()->json(['error' => 'Invalid timestamp'], 401);
+        }
+
+        // 3. Process webhook
+        $this->processWebhook($request->all(), $driverName);
+
+        return response()->json(['status' => 'received']);
+    }
+
+    private function verifySignature(Request $request, string $driverName): bool
+    {
+        $signature = $request->header('X-Webhook-Signature');
+        $webhookSecret = $this->getWebhookSecret($driverName);
+
+        $expectedSignature = hash_hmac(
+            'sha256',
+            $request->getContent(),
+            $webhookSecret
+        );
+
+        return hash_equals($expectedSignature, $signature);
+    }
+
+    private function isTimestampValid(?string $timestamp): bool
+    {
+        if (!$timestamp) {
+            return false;
+        }
+
+        $diff = abs(time() - (int)$timestamp);
+
+        return $diff <= self::MAX_TIMESTAMP_DIFF;
+    }
+}
+```
+
+**Rules:**
+- Use HMAC-SHA256 for signature verification
+- Use `hash_equals()` to prevent timing attacks
+- Implement timestamp validation (5-minute window)
+- Log failed verification attempts
+- Use driver-specific webhook secrets
+
+## Encryption & Sensitive Fields
+
+Use Laravel's encrypter for sensitive database fields:
+
+```php
+<?php
+
+namespace LaraBill\Modules\Provisioning\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+
+class Credential extends Model
+{
+    protected $fillable = [
+        'user_id',
+        'driver_name',
+        'label',
+        'api_key',
+        'api_secret',
+        'metadata',
+    ];
+
+    protected $hidden = [
+        'api_key',
+        'api_secret',
+    ];
+
+    // Encrypt/decrypt API key
+    protected function apiKey(): Attribute
+    {
+        return Attribute::make(
+            get: fn(?string $value) => $value ? decrypt($value) : null,
+            set: fn(?string $value) => $value ? encrypt($value) : null,
+        );
+    }
+
+    // Encrypt/decrypt API secret
+    protected function apiSecret(): Attribute
+    {
+        return Attribute::make(
+            get: fn(?string $value) => $value ? decrypt($value) : null,
+            set: fn(?string $value) => $value ? encrypt($value) : null,
+        );
+    }
+
+    // Store metadata as encrypted JSON
+    protected $casts = [
+        'metadata' => 'encrypted:array',
+    ];
+}
+```
+
+**Fields that should be encrypted:**
+- API keys and secrets
+- OAuth tokens and refresh tokens
+- Third-party credentials
+- Customer payment method tokens
+- Any provider-specific sensitive data
+
+## Credentials Vault
+
+**Store provider credentials per customer, never in .env** for multi-tenant support.
+
+### Migration
+
+```php
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('credentials', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('user_id')->constrained()->cascadeOnDelete();
+            $table->string('driver_name'); // e.g., 'proxmox', 'cpanel'
+            $table->string('label'); // User-friendly name
+
+            // Encrypted credential fields
+            $table->text('api_key');
+            $table->text('api_secret')->nullable();
+            $table->text('metadata')->nullable(); // Additional encrypted data
+
+            $table->boolean('is_active')->default(true);
+            $table->timestamp('last_verified_at')->nullable();
+            $table->timestamps();
+
+            $table->unique(['user_id', 'driver_name', 'label']);
+            $table->index(['user_id', 'driver_name', 'is_active']);
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('credentials');
+    }
+};
+```
+
+### Usage
+
+```php
+<?php
+
+// Store customer credentials
+$credential = Credential::create([
+    'user_id' => auth()->id(),
+    'driver_name' => 'proxmox',
+    'label' => 'Production Cluster',
+    'api_key' => $request->api_key, // Auto-encrypted by Attribute
+    'api_secret' => $request->api_secret,
+    'metadata' => [
+        'node_url' => 'https://proxmox.example.com:8006',
+        'realm' => 'pve',
+    ],
+]);
+
+// Retrieve and use
+$credential = Credential::where('user_id', $userId)
+    ->where('driver_name', 'proxmox')
+    ->where('is_active', true)
+    ->firstOrFail();
+
+$driver = new ProxmoxDriver(
+    apiKey: $credential->api_key, // Auto-decrypted
+    apiSecret: $credential->api_secret,
+    nodeUrl: $credential->metadata['node_url']
+);
+```
+
+**Rules:**
+- One credential record per user per driver per label
+- Never store credentials in config files or .env for production
+- Credentials are user-scoped, not system-wide
+- Support multiple credentials per driver (different servers/accounts)
+
+## Role-Based Access Control (RBAC)
+
+Define granular abilities for provisioning, resources, and credentials:
+
+### Gate Definitions
+
+```php
+<?php
+
+// app/Providers/AuthServiceProvider.php
+
+use Illuminate\Support\Facades\Gate;
+use LaraBill\Modules\Provisioning\Models\Resource;
+use LaraBill\Modules\Provisioning\Models\Credential;
+
+class AuthServiceProvider extends ServiceProvider
+{
+    public function boot(): void
+    {
+        // Provision abilities
+        Gate::define('provision.create', fn(User $user) => $user->can('manage-resources'));
+        Gate::define('provision.retry', fn(User $user) => $user->can('manage-resources'));
+        Gate::define('provision.cancel', fn(User $user) => $user->can('manage-resources'));
+
+        // Resource abilities
+        Gate::define('resource.view', fn(User $user, Resource $resource) =>
+            $user->id === $resource->user_id || $user->isAdmin()
+        );
+
+        Gate::define('resource.suspend', fn(User $user, Resource $resource) =>
+            $user->id === $resource->user_id && $resource->isSuspendable()
+        );
+
+        Gate::define('resource.terminate', fn(User $user, Resource $resource) =>
+            $user->id === $resource->user_id || $user->isAdmin()
+        );
+
+        // Credential abilities
+        Gate::define('credentials.manage', fn(User $user) =>
+            $user->hasRole('customer') || $user->isAdmin()
+        );
+
+        Gate::define('credentials.view', fn(User $user, Credential $credential) =>
+            $user->id === $credential->user_id || $user->isAdmin()
+        );
+    }
+}
+```
+
+### Policy Example
+
+```php
+<?php
+
+namespace LaraBill\Modules\Provisioning\Policies;
+
+use LaraBill\Models\User;
+use LaraBill\Modules\Provisioning\Models\Resource;
+
+class ResourcePolicy
+{
+    public function viewAny(User $user): bool
+    {
+        return $user->hasRole('customer') || $user->isAdmin();
+    }
+
+    public function view(User $user, Resource $resource): bool
+    {
+        return $user->id === $resource->user_id || $user->isAdmin();
+    }
+
+    public function suspend(User $user, Resource $resource): bool
+    {
+        // Admins can suspend, users cannot suspend their own resources
+        return $user->isAdmin();
+    }
+
+    public function terminate(User $user, Resource $resource): bool
+    {
+        return $user->id === $resource->user_id || $user->isAdmin();
+    }
+}
+```
+
+**Abilities structure:**
+- `provision.*`: Creating and managing provisioning jobs
+- `resource.*`: Viewing, suspending, terminating resources
+- `credentials.*`: Managing provider API credentials
+
+## Append-Only Audit Logs
+
+**Never update or delete audit records.** They must be immutable for compliance.
+
+### Audit Log Model
+
+```php
+<?php
+
+namespace LaraBill\Modules\Provisioning\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class ProvisionAudit extends Model
+{
+    public const UPDATED_AT = null; // No updated_at column
+
+    protected $fillable = [
+        'resource_id',
+        'from_state',
+        'to_state',
+        'triggered_by',
+        'metadata',
+    ];
+
+    protected $casts = [
+        'metadata' => 'array',
+    ];
+
+    // Prevent updates and deletes
+    public static function boot()
+    {
+        parent::boot();
+
+        static::updating(function () {
+            throw new \RuntimeException('Audit logs cannot be updated');
+        });
+
+        static::deleting(function () {
+            throw new \RuntimeException('Audit logs cannot be deleted');
+        });
+    }
+
+    public function resource()
+    {
+        return $this->belongsTo(Resource::class);
+    }
+}
+```
+
+### Creating Audit Entries
+
+```php
+<?php
+
+use LaraBill\Modules\Provisioning\Models\ProvisionAudit;
+
+// Log state transition
+ProvisionAudit::create([
+    'resource_id' => $resource->id,
+    'from_state' => 'QUEUED',
+    'to_state' => 'PROVISIONING',
+    'triggered_by' => auth()->id() ?? 'system',
+    'metadata' => [
+        'driver' => $resource->driver_name,
+        'task_id' => $taskId,
+        'ip_address' => request()->ip(),
+    ],
+]);
+
+// Log failure
+ProvisionAudit::create([
+    'resource_id' => $resource->id,
+    'from_state' => 'PROVISIONING',
+    'to_state' => 'FAILED',
+    'triggered_by' => 'system',
+    'metadata' => [
+        'error' => $exception->getMessage(),
+        'attempt' => $attempt,
+    ],
+]);
+```
+
+### Migration
+
+```php
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('provision_audits', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('resource_id')->constrained();
+            $table->string('from_state');
+            $table->string('to_state');
+            $table->string('triggered_by')->nullable(); // user_id or 'system'
+            $table->json('metadata')->nullable();
+            $table->timestamp('created_at'); // No updated_at
+
+            $table->index(['resource_id', 'created_at']);
+            $table->index('created_at');
+        });
+    }
+};
+```
+
+**Rules:**
+- No `updated_at` column
+- Model prevents updates/deletes via boot hooks
+- Store actor (user or system) who triggered change
+- Include relevant context in metadata
+- Index by resource_id and created_at for querying history
+
+## Security Checklist
+
+- [ ] All API tokens and secrets are encrypted at rest
+- [ ] No PII in application logs
+- [ ] Webhook endpoints verify signature and timestamp
+- [ ] Audit logs are append-only (no updates/deletes)
+- [ ] RBAC policies prevent unauthorized resource access
+- [ ] Provider credentials are per-customer, not system-wide
+- [ ] Failed authentication attempts are logged
+- [ ] Sensitive query parameters are excluded from logs

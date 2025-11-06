@@ -1,0 +1,475 @@
+---
+name: LaraBill Coding Standards
+description: PHP patterns, service layer, money handling, eager loading, and transactions
+alwaysApply: always
+globs:
+  - "**/*.php"
+  - "app/Modules/**/Services/**"
+  - "app/Modules/**/Actions/**"
+---
+
+## PHP Version & Type Safety
+
+Use PHP 8.3+ features with strict types:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace LaraBill\Modules\Billing\Services;
+
+use LaraBill\Modules\Billing\Models\Invoice;
+use Carbon\Carbon;
+
+class InvoiceService
+{
+    public function __construct(
+        private TaxCalculator $taxCalculator,
+        private InvoiceRepository $repository
+    ) {}
+
+    public function createInvoice(int $userId, array $items): Invoice
+    {
+        // Implementation
+    }
+}
+```
+
+**Rules:**
+- Always use `declare(strict_types=1)` at the top of files
+- Type hint all parameters and return types
+- Use readonly properties where applicable (PHP 8.1+)
+- Prefer constructor property promotion
+
+## Service Layer Pattern
+
+**Never put business logic in controllers or models.** Use dedicated Service or Action classes.
+
+### Controller (Thin)
+
+```php
+<?php
+
+namespace LaraBill\Modules\Billing\Http\Controllers;
+
+use LaraBill\Modules\Billing\Services\RenewalService;
+use LaraBill\Modules\Billing\Http\Requests\RenewSubscriptionRequest;
+
+class SubscriptionController extends Controller
+{
+    public function __construct(
+        private RenewalService $renewalService
+    ) {}
+
+    public function renew(RenewSubscriptionRequest $request, int $subscriptionId)
+    {
+        $subscription = $this->renewalService->renewSubscription(
+            subscriptionId: $subscriptionId,
+            paymentMethodId: $request->payment_method_id
+        );
+
+        return response()->json([
+            'subscription' => $subscription,
+            'invoice' => $subscription->latestInvoice,
+        ]);
+    }
+}
+```
+
+### Service (Business Logic)
+
+```php
+<?php
+
+namespace LaraBill\Modules\Billing\Services;
+
+use Illuminate\Support\Facades\DB;
+use LaraBill\Modules\Billing\Models\Subscription;
+use LaraBill\Modules\Invoicing\Services\InvoiceService;
+use LaraBill\Modules\Billing\Events\SubscriptionRenewed;
+
+class RenewalService
+{
+    public function __construct(
+        private InvoiceService $invoiceService,
+        private PaymentProcessor $paymentProcessor
+    ) {}
+
+    public function renewSubscription(int $subscriptionId, int $paymentMethodId): Subscription
+    {
+        return DB::transaction(function () use ($subscriptionId, $paymentMethodId) {
+            $subscription = Subscription::lockForUpdate()->findOrFail($subscriptionId);
+
+            // Generate renewal invoice
+            $invoice = $this->invoiceService->createRenewalInvoice($subscription);
+
+            // Process payment
+            $payment = $this->paymentProcessor->charge(
+                amount: $invoice->total,
+                paymentMethodId: $paymentMethodId,
+                metadata: ['invoice_id' => $invoice->id]
+            );
+
+            // Update subscription
+            $subscription->renew(
+                nextDueDate: now()->addMonth(),
+                invoiceId: $invoice->id
+            );
+
+            event(new SubscriptionRenewed($subscription, $invoice));
+
+            return $subscription->fresh('latestInvoice');
+        });
+    }
+}
+```
+
+**Benefits:**
+- Testable without HTTP layer
+- Reusable across controllers, commands, jobs
+- Clear separation of concerns
+- Easier to maintain and refactor
+
+## Money Handling
+
+**Always use DECIMAL(19,4) for money values** to avoid floating-point precision issues.
+
+### Migration Example
+
+```php
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('invoices', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('user_id')->constrained();
+
+            // Money columns: DECIMAL(19,4)
+            $table->decimal('subtotal', 19, 4)->default(0);
+            $table->decimal('tax_amount', 19, 4)->default(0);
+            $table->decimal('total', 19, 4)->default(0);
+
+            $table->timestamps();
+        });
+
+        Schema::create('invoice_items', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('invoice_id')->constrained()->cascadeOnDelete();
+            $table->string('description');
+            $table->integer('quantity')->default(1);
+
+            // Unit price and line total
+            $table->decimal('unit_price', 19, 4);
+            $table->decimal('line_total', 19, 4);
+
+            $table->timestamps();
+        });
+    }
+};
+```
+
+### Money Value Object (Optional)
+
+```php
+<?php
+
+namespace LaraBill\Core\ValueObjects;
+
+class Money
+{
+    public function __construct(
+        private string $amount,
+        private string $currency = 'USD'
+    ) {}
+
+    public static function fromCents(int $cents, string $currency = 'USD'): self
+    {
+        return new self(
+            amount: bcdiv((string)$cents, '100', 4),
+            currency: $currency
+        );
+    }
+
+    public function add(Money $other): self
+    {
+        return new self(
+            amount: bcadd($this->amount, $other->amount, 4),
+            currency: $this->currency
+        );
+    }
+
+    public function toCents(): int
+    {
+        return (int)bcmul($this->amount, '100', 0);
+    }
+}
+```
+
+**Rules:**
+- Use `bcmath` functions for money arithmetic: `bcadd()`, `bcsub()`, `bcmul()`, `bcdiv()`
+- Always specify precision: 4 decimal places
+- Never use float arithmetic for money
+- Store currency alongside amount when supporting multiple currencies
+
+## Transactions
+
+Wrap related database operations in transactions, especially for renewals, invoices, and payments:
+
+```php
+<?php
+
+use Illuminate\Support\Facades\DB;
+
+public function processPayment(Invoice $invoice, PaymentMethod $method): Payment
+{
+    return DB::transaction(function () use ($invoice, $method) {
+        // 1. Create payment record
+        $payment = Payment::create([
+            'invoice_id' => $invoice->id,
+            'amount' => $invoice->total,
+            'status' => 'pending',
+        ]);
+
+        // 2. Charge payment method (may throw exception)
+        $charge = $this->gateway->charge($method, $invoice->total);
+
+        // 3. Update payment status
+        $payment->update([
+            'status' => 'completed',
+            'gateway_transaction_id' => $charge->id,
+        ]);
+
+        // 4. Mark invoice as paid
+        $invoice->markAsPaid($payment);
+
+        // 5. Trigger provisioning (if applicable)
+        if ($invoice->requiresProvisioning()) {
+            event(new PaymentCaptured($payment));
+        }
+
+        return $payment;
+    });
+}
+```
+
+**When to use transactions:**
+- Creating invoice + invoice items
+- Processing payment + updating invoice status
+- Renewing subscription + generating invoice
+- Any operation where partial completion would leave inconsistent state
+
+## Eager Loading & Query Optimization
+
+**Kill N+1 queries** by eager loading relationships:
+
+### Bad (N+1 Query)
+
+```php
+<?php
+
+// Controller
+$invoices = Invoice::where('user_id', $userId)->get();
+
+// View loops through invoices
+@foreach($invoices as $invoice)
+    {{ $invoice->user->name }}  <!-- Triggers query for each invoice -->
+    {{ $invoice->items->count() }}  <!-- Triggers query for each invoice -->
+@endforeach
+```
+
+### Good (Eager Loading)
+
+```php
+<?php
+
+// Controller
+$invoices = Invoice::with(['user', 'items'])
+    ->withCount('items')
+    ->where('user_id', $userId)
+    ->get();
+
+// Or use loadCount for existing models
+$invoice->loadCount('items');
+```
+
+### Pagination Required
+
+**Never fetch unbounded result sets:**
+
+```php
+<?php
+
+// Bad: Could return millions of records
+$invoices = Invoice::all();
+
+// Good: Paginated
+$invoices = Invoice::query()
+    ->with('user')
+    ->orderBy('created_at', 'desc')
+    ->paginate(25);
+
+// Good: Cursor pagination for large datasets
+$invoices = Invoice::query()
+    ->orderBy('id')
+    ->cursorPaginate(50);
+```
+
+## Code Quality Tools
+
+### Laravel Pint
+
+Run before every commit:
+
+```bash
+./vendor/bin/pint
+```
+
+Configuration in `pint.json`:
+
+```json
+{
+    "preset": "laravel",
+    "rules": {
+        "strict_types": true,
+        "declare_strict_types": true
+    }
+}
+```
+
+### Larastan / PHPStan
+
+Run at max level:
+
+```bash
+./vendor/bin/phpstan analyse --memory-limit=2G
+```
+
+Configuration in `phpstan.neon`:
+
+```neon
+parameters:
+    level: max
+    paths:
+        - app/Core
+        - app/Modules
+        - app/Drivers
+    excludePaths:
+        - app/Modules/*/Database/Migrations/*
+```
+
+## Commit Message Format
+
+Use conventional commits with emoji prefixes:
+
+```
+✨ feat: Add subscription renewal service
+🚀 perf: Optimize invoice query with eager loading
+🐛 fix: Correct tax calculation for multi-currency
+🔧 chore: Update dependencies to latest versions
+♻️ refactor: Extract payment logic to service class
+📝 docs: Add API documentation for billing endpoints
+✅ test: Add unit tests for Money value object
+```
+
+**Format:** `<emoji> <type>: <description>`
+
+**Types:**
+- `feat`: New feature
+- `fix`: Bug fix
+- `perf`: Performance improvement
+- `refactor`: Code refactoring (no behavior change)
+- `chore`: Maintenance tasks
+- `docs`: Documentation updates
+- `test`: Adding or updating tests
+
+## Pull Request Requirements
+
+Every PR must include:
+
+1. **Migration files** (if database changes)
+   - Include both `up()` and `down()` methods
+   - Test rollback before submitting
+
+2. **Rollback notes** in PR description
+   - Steps to safely revert changes
+   - Data migration considerations
+
+3. **Performance notes**
+   - Database indexes added/modified
+   - Query optimization details
+   - Load testing results (if applicable)
+
+4. **Linked issues**
+   - Reference GitHub issues: `Closes #123`
+   - Explain how issue is resolved
+
+5. **Tests**
+   - Unit tests for services/actions
+   - Feature tests for HTTP endpoints
+   - Coverage should not decrease
+
+## Code Organization Best Practices
+
+1. **One class, one responsibility**: Keep classes focused
+2. **Extract complex logic**: Use private methods for clarity
+3. **Named parameters**: Use for methods with many parameters
+4. **Early returns**: Reduce nesting with guard clauses
+5. **Avoid magic numbers**: Use named constants or config values
+
+### Example: Named Parameters
+
+```php
+<?php
+
+// Good: Clear what each parameter represents
+$invoice = $this->invoiceService->create(
+    userId: $user->id,
+    items: $cartItems,
+    dueDate: now()->addDays(30),
+    taxRate: 0.0825
+);
+
+// Bad: Unclear parameter meaning
+$invoice = $this->invoiceService->create($user->id, $cartItems, now()->addDays(30), 0.0825);
+```
+
+### Example: Guard Clauses
+
+```php
+<?php
+
+// Good: Early returns reduce nesting
+public function processRefund(Payment $payment): Refund
+{
+    if ($payment->isRefunded()) {
+        throw new PaymentAlreadyRefunded();
+    }
+
+    if (!$payment->isRefundable()) {
+        throw new PaymentNotRefundable();
+    }
+
+    return $this->gateway->refund($payment);
+}
+
+// Bad: Deeply nested
+public function processRefund(Payment $payment): Refund
+{
+    if (!$payment->isRefunded()) {
+        if ($payment->isRefundable()) {
+            return $this->gateway->refund($payment);
+        } else {
+            throw new PaymentNotRefundable();
+        }
+    } else {
+        throw new PaymentAlreadyRefunded();
+    }
+}
+```

@@ -12,11 +12,13 @@
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",
+        "larastan/larastan": "^3.8",
         "laravel/pail": "^1.2.2",
-        "laravel/pint": "^1.24",
+        "laravel/pint": "^1.25",
         "laravel/sail": "^1.41",
         "mockery/mockery": "^1.6",
         "nunomaduro/collision": "^8.6",
+        "phpstan/phpstan": "^2.1",
         "phpunit/phpunit": "^11.5.3"
     },
     "autoload": {
@@ -65,6 +67,21 @@
         ],
         "pre-package-uninstall": [
             "Illuminate\\Foundation\\ComposerScripts::prePackageUninstall"
+        ],
+        "phpstan": [
+            "vendor/bin/phpstan analyse --memory-limit=1G"
+        ],
+        "phpstan-baseline": [
+            "vendor/bin/phpstan analyse --generate-baseline --memory-limit=1G"
+        ],
+        "phpstan-clear-cache": [
+            "vendor/bin/phpstan clear-result-cache"
+        ],
+        "format": [
+            "vendor/bin/pint --test"
+        ],
+        "format-fix": [
+            "vendor/bin/pint --repair"
         ]
     },
     "extra": {

@@ -1,0 +1,452 @@
+---
+name: LaraBill Database & Frontend
+description: Migrations, indexing, Vite setup, asset loading, and dependency management
+alwaysApply: contextual
+globs:
+  - "database/migrations/**"
+  - "app/Modules/**/Database/Migrations/**"
+  - "app/Modules/**/Resources/**"
+  - "vite.config.*"
+  - "package.json"
+  - "composer.json"
+---
+
+## Database Migrations
+
+### Migration Location
+
+Each module stores migrations in its own directory:
+
+```
+app/Modules/Billing/src/Database/Migrations/
+app/Modules/Invoicing/src/Database/Migrations/
+app/Modules/Provisioning/src/Database/Migrations/
+app/Drivers/Compute/Proxmox/Database/Migrations/
+```
+
+Laravel auto-loads these via `loadMigrationsFrom()` in the module's service provider.
+
+### Module Service Provider
+
+```php
+<?php
+
+namespace LaraBill\Modules\Billing\Providers;
+
+use Illuminate\Support\ServiceProvider;
+
+class BillingServiceProvider extends ServiceProvider
+{
+    public function boot(): void
+    {
+        $this->loadMigrationsFrom(__DIR__ . '/../Database/Migrations');
+    }
+}
+```
+
+### Migration Best Practices
+
+**One concern per migration** - create one table or make one change per migration file. Never combine multiple unrelated tables.
+
+### Money Columns
+
+Always use `DECIMAL(19,4)` for money values:
+
+```php
+<?php
+
+Schema::create('invoices', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('user_id')->constrained();
+
+    // Money columns: DECIMAL(19,4)
+    $table->decimal('subtotal', 19, 4)->default(0);
+    $table->decimal('tax_amount', 19, 4)->default(0);
+    $table->decimal('discount_amount', 19, 4)->default(0);
+    $table->decimal('total', 19, 4)->default(0);
+
+    $table->string('currency', 3)->default('USD');
+    $table->string('status');
+    $table->date('due_date');
+    $table->timestamps();
+});
+```
+
+**Why DECIMAL(19,4)?**
+- 19 total digits: supports values up to 999 trillion
+- 4 decimal places: handles sub-cent precision
+- No floating-point rounding errors
+
+### Composite Indexes
+
+Create indexes for common query patterns:
+
+```php
+<?php
+
+Schema::create('invoices', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('user_id')->constrained();
+    $table->string('status');
+    $table->date('due_date');
+    $table->decimal('total', 19, 4);
+    $table->timestamps();
+
+    // Composite indexes for common queries
+    $table->index(['user_id', 'status']); // WHERE user_id = ? AND status = ?
+    $table->index(['status', 'due_date']); // WHERE status = ? ORDER BY due_date
+    $table->index(['user_id', 'created_at']); // User's invoice history
+});
+
+Schema::create('resources', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('order_id')->constrained();
+    $table->string('status');
+    $table->string('driver_name');
+    $table->timestamps();
+
+    // Query by status for bulk operations
+    $table->index('status');
+
+    // Find resources by driver
+    $table->index(['driver_name', 'status']);
+
+    // Order resources history
+    $table->index(['order_id', 'created_at']);
+});
+```
+
+### Foreign Key Relationships
+
+Link billing items to provisioned resources:
+
+```php
+<?php
+
+Schema::create('billing_items', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('invoice_id')->constrained()->cascadeOnDelete();
+    $table->string('description');
+    $table->decimal('unit_price', 19, 4);
+    $table->integer('quantity')->default(1);
+    $table->decimal('line_total', 19, 4);
+
+    // Optional: Link to provisioned resource
+    $table->foreignId('resource_id')->nullable()->constrained();
+
+    $table->timestamps();
+
+    $table->index('resource_id'); // Find billing items for a resource
+});
+```
+
+### Never Edit Migration History
+
+**Once committed and deployed, never edit existing migrations.** Create new migrations to add columns or make changes.
+
+## Frontend Assets with Vite
+
+### Vite Configuration
+
+Single `vite.config.js` auto-discovers module assets:
+
+```javascript
+import { defineConfig } from 'vite';
+import laravel from 'laravel-vite-plugin';
+import { glob } from 'glob';
+import path from 'path';
+
+// Auto-discover module entry points
+const moduleAssets = glob.sync('app/Modules/*/src/Resources/assets/app.{ts,js,scss,css}');
+
+export default defineConfig({
+    plugins: [
+        laravel({
+            input: [
+                'resources/css/app.css',
+                'resources/js/app.js',
+                ...moduleAssets, // Include all module assets
+            ],
+            refresh: true,
+        }),
+    ],
+    resolve: {
+        alias: {
+            '@': '/resources/js',
+            '@modules': '/app/Modules',
+        },
+    },
+});
+```
+
+### Module Asset Structure
+
+```
+app/Modules/Billing/src/Resources/
+├── assets/
+│   ├── app.ts         # Module JavaScript entry point
+│   └── app.scss       # Module styles entry point
+└── views/
+    └── dashboard.blade.php
+```
+
+### Module Assets Example
+
+```typescript
+// app/Modules/Billing/src/Resources/assets/app.ts
+
+import './app.scss';
+import { createApp } from 'vue';
+import InvoiceList from './components/InvoiceList.vue';
+
+const app = createApp({});
+
+app.component('invoice-list', InvoiceList);
+
+app.mount('#billing-app');
+```
+
+```scss
+// app/Modules/Billing/src/Resources/assets/app.scss
+
+.invoice-list {
+    display: grid;
+    gap: 1rem;
+
+    .invoice-item {
+        padding: 1rem;
+        border: 1px solid #e5e7eb;
+        border-radius: 0.5rem;
+    }
+}
+```
+
+### Loading Assets in Blade Views
+
+```blade
+{{-- app/Modules/Billing/src/Resources/views/dashboard.blade.php --}}
+
+@extends('layouts.app')
+
+@section('content')
+    <div id="billing-app">
+        <invoice-list :user-id="{{ auth()->id() }}"></invoice-list>
+    </div>
+@endsection
+
+@push('scripts')
+    @vite('app/Modules/Billing/src/Resources/assets/app.ts')
+@endpush
+
+@push('styles')
+    @vite('app/Modules/Billing/src/Resources/assets/app.scss')
+@endpush
+```
+
+### Optional: @viteIfExists Directive
+
+Guard against missing module assets:
+
+```php
+<?php
+
+// app/Providers/AppServiceProvider.php
+
+use Illuminate\Support\Facades\Blade;
+use Illuminate\Support\Facades\File;
+
+public function boot(): void
+{
+    Blade::directive('viteIfExists', function ($expression) {
+        return "<?php if (file_exists(base_path({$expression}))): ?>
+            <?php echo app(\\Illuminate\\Foundation\\Vite::class)({$expression}); ?>
+        <?php endif; ?>";
+    });
+}
+```
+
+Usage:
+
+```blade
+@viteIfExists('app/Modules/Provisioning/src/Resources/assets/app.ts')
+```
+
+### Build Process
+
+Build all module assets at once:
+
+```bash
+# Development
+npm run dev
+
+# Production build
+npm run build
+```
+
+Output goes to `public/build/`:
+
+```
+public/build/
+├── manifest.json
+├── assets/
+│   ├── app-[hash].js
+│   ├── app-[hash].css
+│   ├── Billing-app-[hash].js
+│   └── Provisioning-app-[hash].js
+```
+
+## Driver Admin UI
+
+Drivers can provide admin configuration UI:
+
+```
+app/Drivers/Compute/Proxmox/src/Resources/
+└── views/
+    └── admin/
+        ├── config.blade.php    # Driver settings form
+        └── test.blade.php      # Connection test UI
+```
+
+### Example Admin View
+
+```blade
+{{-- app/Drivers/Compute/Proxmox/src/Resources/views/admin/config.blade.php --}}
+
+<form method="POST" action="{{ route('admin.drivers.proxmox.save') }}">
+    @csrf
+
+    <div class="form-group">
+        <label>Node URL</label>
+        <input type="url" name="node_url" value="{{ old('node_url', $config['node_url'] ?? '') }}" required>
+    </div>
+
+    <div class="form-group">
+        <label>API Token ID</label>
+        <input type="text" name="api_token_id" value="{{ old('api_token_id') }}" required>
+    </div>
+
+    <div class="form-group">
+        <label>API Secret</label>
+        <input type="password" name="api_secret" required>
+        <small>Will be encrypted before storage</small>
+    </div>
+
+    <button type="submit">Save Configuration</button>
+</form>
+```
+
+## Dependency Management
+
+### Composer (PHP Dependencies)
+
+All PHP dependencies in root `composer.json`:
+
+```json
+{
+    "require": {
+        "php": "^8.3",
+        "laravel/framework": "^11.0",
+        "brick/money": "^0.9",
+        "guzzlehttp/guzzle": "^7.8"
+    },
+    "require-dev": {
+        "laravel/pint": "^1.13",
+        "larastan/larastan": "^2.8",
+        "pestphp/pest": "^2.34"
+    }
+}
+```
+
+### NPM (JavaScript Dependencies)
+
+All JS dependencies in root `package.json`:
+
+```json
+{
+    "devDependencies": {
+        "@vitejs/plugin-vue": "^5.0.0",
+        "vite": "^5.0.0",
+        "laravel-vite-plugin": "^1.0.0",
+        "typescript": "^5.3.0"
+    },
+    "dependencies": {
+        "vue": "^3.4.0",
+        "@vueuse/core": "^10.7.0",
+        "axios": "^1.6.0"
+    }
+}
+```
+
+### Module Dependency Declaration
+
+Modules declare desired dependencies in `module.json` (validated, not auto-installed):
+
+```json
+{
+    "name": "Provisioning",
+    "enabled": true,
+    "dependencies": {
+        "modules": ["Billing", "Invoicing"],
+        "composer": {
+            "brick/money": "^0.9",
+            "symfony/process": "^6.4"
+        },
+        "npm": {
+            "@vueuse/core": "^10.0",
+            "chart.js": "^4.4"
+        }
+    }
+}
+```
+
+### Dependency Validation
+
+Run validation commands to check if declared dependencies are installed:
+
+```bash
+# Validate PHP dependencies
+php artisan larabill:doctor
+
+# Validate NPM dependencies
+npm run doctor:npm
+```
+
+**Important:** These commands **validate only, never auto-install**. Developers must manually add dependencies to root `composer.json` or `package.json`.
+
+### Doctor Command
+
+`php artisan larabill:doctor` checks that all module dependencies declared in `module.json` are installed. It validates only—never auto-installs packages.
+
+## Database & Asset Best Practices
+
+1. **Migration naming**: Use descriptive names with timestamps
+2. **Test rollbacks**: Always test `down()` methods before deploying
+3. **Index strategically**: Index columns used in WHERE, JOIN, ORDER BY
+4. **Asset organization**: Keep module assets self-contained
+5. **Production builds**: Always run `npm run build` before deploying
+6. **Cache busting**: Vite automatically handles with content hashes
+7. **Lazy load modules**: Load module assets only on pages that need them
+
+### Migration Rollback Test
+
+```bash
+# Apply migration
+php artisan migrate
+
+# Test rollback
+php artisan migrate:rollback --step=1
+
+# Re-apply
+php artisan migrate
+```
+
+### Production Deployment Checklist
+
+- [ ] Run `composer install --no-dev --optimize-autoloader`
+- [ ] Run `npm ci` (clean install from lock file)
+- [ ] Run `npm run build` (production Vite build)
+- [ ] Run `php artisan migrate --force`
+- [ ] Run `php artisan config:cache`
+- [ ] Run `php artisan route:cache`
+- [ ] Run `php artisan view:cache`
+- [ ] Verify all module dependencies with `php artisan larabill:doctor`
